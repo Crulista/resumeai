@@ -3,7 +3,7 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "https://YOUR_RENDER_URL.onrender.com/api/$1" },
+    { "source": "/api/(.*)", "destination": "https://resumeai-he1v.onrender.com" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
