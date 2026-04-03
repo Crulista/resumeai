@@ -4,16 +4,16 @@ const pdfParse = require('pdf-parse');
 const { requireAuth } = require('../middleware/auth');
 const { checkPaywall } = require('../middleware/paywall');
 const { parseResume } = require('../engine/parser');
-const { extractKeywords, scoreResume, selectTopContent } = require('../engine/ruleEngine');
-const { rewriteBullets, generateSummary } = require('../engine/aiEngine');
-const { buildResume, formatAsText } = require('../engine/formatter');
+const { extractKeywords, scoreResume } = require('../engine/ruleEngine');
+const { generateTailoredResume, generateInsights, getAnthropicInstance } = require('../engine/aiEngine');
+const { formatAsText } = require('../engine/formatter');
 const { renderTemplate } = require('../engine/templates');
 const pool = require('../config/db');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
-// PDF upload endpoint - extracts text from PDF
+// PDF upload
 router.post('/upload-pdf', requireAuth, upload.single('resume'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -22,11 +22,19 @@ router.post('/upload-pdf', requireAuth, upload.single('resume'), async (req, res
     }
 
     const data = await pdfParse(req.file.buffer);
-    const text = data.text?.trim();
+    let text = data.text?.trim();
 
     if (!text || text.length < 50) {
       return res.status(400).json({ error: 'Could not extract enough text from this PDF. Try pasting your resume as text instead.' });
     }
+
+    // Clean up common PDF extraction artifacts
+    text = text
+      .replace(/\r\n/g, '\n')
+      .replace(/\f/g, '\n')  // form feeds
+      .replace(/\t+/g, ' ')
+      .replace(/ {3,}/g, '  ')  // collapse excessive spaces
+      .replace(/\n{3,}/g, '\n\n');  // collapse excessive newlines
 
     res.json({ text, pageCount: data.numpages, charCount: text.length });
   } catch (err) {
@@ -35,16 +43,7 @@ router.post('/upload-pdf', requireAuth, upload.single('resume'), async (req, res
   }
 });
 
-// Validate resume has required fields
-function validateResumeFields(parsed) {
-  const missing = [];
-  if (!parsed.name || parsed.name.length < 2) missing.push('name');
-  if (!parsed.contact.email && !parsed.contact.phone) missing.push('email or phone number');
-  if (parsed.experience.length === 0 && parsed.projects.length === 0) missing.push('work experience or projects');
-  if (parsed.skills.length === 0) missing.push('skills');
-  return missing;
-}
-
+// Main generate endpoint
 router.post('/', requireAuth, checkPaywall, async (req, res) => {
   const startTime = Date.now();
 
@@ -55,63 +54,52 @@ router.post('/', requireAuth, checkPaywall, async (req, res) => {
       return res.status(400).json({ error: 'Resume and job description are required' });
     }
 
-    if (resume.length > 20000 || jobDescription.length > 15000) {
-      return res.status(400).json({ error: 'Input too long. Keep resume under 20k and JD under 15k characters.' });
-    }
+    // Step 1: Parse resume (uses AI for messy PDF text)
+    const anthropic = getAnthropicInstance();
+    const parsedResume = await parseResume(resume, anthropic);
 
-    // Step 1: Parse resume
-    const parsedResume = parseResume(resume);
+    // Step 2: Validate minimum fields
+    const missing = [];
+    if (!parsedResume.name || parsedResume.name.length < 2) missing.push('name');
+    if (!parsedResume.contact?.email && !parsedResume.contact?.phone) missing.push('email or phone');
+    if ((!parsedResume.experience || parsedResume.experience.length === 0) &&
+        (!parsedResume.projects || parsedResume.projects.length === 0)) missing.push('work experience or projects');
 
-    // Step 1b: Validate required fields
-    const missingFields = validateResumeFields(parsedResume);
-    if (missingFields.length > 0) {
+    if (missing.length > 0) {
       return res.status(400).json({
         error: 'missing_fields',
-        message: `Your resume is missing: ${missingFields.join(', ')}. Please add these before generating.`,
-        missing: missingFields,
+        message: `Your resume is missing: ${missing.join(', ')}. Please add these before generating.`,
+        missing,
       });
     }
 
-    // Step 2: Extract keywords from JD
+    // Step 3: Extract JD keywords and score
     const keywords = extractKeywords(jobDescription);
-
-    // Step 3: Score and rank
     const scoredData = scoreResume(parsedResume, keywords);
 
-    // Step 4: Select top content — enforce 1-page by limiting bullets
-    // Aim for ~450 words max (fits 1 page with standard formatting)
-    const selectedContent = selectTopContent(scoredData, 3, 3); // max 3 bullets per job, max 3 jobs
+    // Step 4: AI-powered tailored resume generation
+    let finalResume = await generateTailoredResume(parsedResume, jobDescription, jobTitle, company, keywords);
 
-    // Step 5: Collect all bullets for rewriting
-    const allBullets = [];
-    for (const exp of selectedContent.experience) {
-      allBullets.push(...exp.topBullets);
+    // Fallback: if AI fails, use parsed resume directly
+    if (!finalResume) {
+      finalResume = parsedResume;
     }
 
-    // Step 6: AI rewrite - STRICT no hallucination
-    const jobContext = `${jobTitle || 'the role'} at ${company || 'the company'}. Key skills: ${keywords.technical.slice(0, 10).join(', ')}`;
-    const rewrittenBullets = await rewriteBullets(allBullets, jobContext);
+    // Ensure contact info is preserved
+    if (!finalResume.contact || Object.keys(finalResume.contact).length === 0) {
+      finalResume.contact = parsedResume.contact;
+    }
+    if (!finalResume.name) finalResume.name = parsedResume.name;
 
-    // Step 7: Summary from ACTUAL resume data only
-    const summary = await generateSummary(
-      parsedResume.name,
-      selectedContent.skills.slice(0, 5),
-      jobTitle || 'this role',
-      company || ''
-    );
-
-    // Step 8: Build resume
-    const finalResume = buildResume(parsedResume, selectedContent, rewrittenBullets, summary);
+    // Step 5: Format outputs
     const formattedText = formatAsText(finalResume);
-
-    // Step 9: Render with selected template
     const templateId = template || 'classic';
     const formattedHTML = renderTemplate(templateId, finalResume);
 
-    // Step 10: Build insights (what's missing from JD)
-    const insights = buildInsights(parsedResume, keywords, scoredData);
+    // Step 6: Generate insights
+    const insights = await generateInsights(parsedResume, jobDescription, keywords, scoredData.atsScore);
 
-    // Step 11: Decrement free uses
+    // Step 7: Decrement free uses
     if (req.isFreeUse) {
       await pool.query(
         'UPDATE users SET free_uses_remaining = GREATEST(free_uses_remaining - 1, 0) WHERE id = $1',
@@ -119,10 +107,10 @@ router.post('/', requireAuth, checkPaywall, async (req, res) => {
       );
     }
 
-    // Step 12: Save generation
+    // Step 8: Save
     const genResult = await pool.query(
       'INSERT INTO generations (user_id, job_title, company, ats_score, gen_type) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [req.user.id, jobTitle, company, selectedContent.atsScore, 'resume']
+      [req.user.id, jobTitle, company, scoredData.atsScore, 'resume']
     );
 
     await pool.query(
@@ -130,19 +118,17 @@ router.post('/', requireAuth, checkPaywall, async (req, res) => {
       [genResult.rows[0].id, req.user.id, JSON.stringify(finalResume), formattedText]
     );
 
-    const elapsed = Date.now() - startTime;
-
     res.json({
       success: true,
       resume: finalResume,
       text: formattedText,
       html: formattedHTML,
-      atsScore: selectedContent.atsScore,
+      atsScore: scoredData.atsScore,
       matchedKeywords: scoredData.matchedKeywords,
       totalKeywords: scoredData.totalKeywords,
       insights,
       generationId: genResult.rows[0].id,
-      processingTimeMs: elapsed,
+      processingTimeMs: Date.now() - startTime,
       freeUsesRemaining: req.isFreeUse ? req.user.free_uses_remaining - 1 : null,
     });
   } catch (err) {
@@ -150,57 +136,6 @@ router.post('/', requireAuth, checkPaywall, async (req, res) => {
     res.status(500).json({ error: 'Resume generation failed. Please try again.' });
   }
 });
-
-// Build insights about what's missing
-function buildInsights(parsedResume, keywords, scoredData) {
-  const resumeText = JSON.stringify(parsedResume).toLowerCase();
-
-  const missingTech = keywords.technical.filter(kw => !resumeText.includes(kw));
-  const matchedTech = keywords.technical.filter(kw => resumeText.includes(kw));
-
-  const suggestions = [];
-
-  if (missingTech.length > 0) {
-    suggestions.push({
-      type: 'missing_skills',
-      severity: 'high',
-      title: 'Missing technical skills from JD',
-      items: missingTech,
-      tip: 'If you have experience with any of these, add them to your resume before generating.',
-    });
-  }
-
-  const totalBullets = parsedResume.experience.flatMap(e => e.bullets).length;
-  const quantified = parsedResume.experience.flatMap(e => e.bullets)
-    .filter(b => /\d+%|\$[\d,]+|[\d,]+ users|\dx\b/i.test(b)).length;
-
-  if (totalBullets > 0 && quantified / totalBullets < 0.3) {
-    suggestions.push({
-      type: 'quantify',
-      severity: 'medium',
-      title: 'Add more numbers',
-      items: [`Only ${quantified} of ${totalBullets} bullets have quantified results`],
-      tip: 'Add %, $, or user counts to more bullet points for stronger impact.',
-    });
-  }
-
-  if (!parsedResume.summary) {
-    suggestions.push({
-      type: 'summary',
-      severity: 'low',
-      title: 'No professional summary found',
-      items: [],
-      tip: 'A tailored summary was generated for you, but adding one to your master resume helps.',
-    });
-  }
-
-  return {
-    score: scoredData.atsScore,
-    matchedSkills: matchedTech,
-    missingSkills: missingTech,
-    suggestions,
-  };
-}
 
 // History
 router.get('/history', requireAuth, async (req, res) => {
