@@ -88,6 +88,16 @@ BEGIN
   END IF;
 END $$;
 
+-- Migration: add gen_type to generations
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'generations')
+     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'generations' AND column_name = 'gen_type')
+  THEN
+    ALTER TABLE generations ADD COLUMN gen_type VARCHAR(50) DEFAULT 'resume';
+  END IF;
+END $$;
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_generations_user ON generations(user_id);
 CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id);
