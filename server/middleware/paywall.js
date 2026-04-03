@@ -2,6 +2,12 @@
 function checkPaywall(req, res, next) {
   const user = req.user;
 
+  // Admin - always allow
+  if (user.is_admin) {
+    req.isFreeUse = false;
+    return next();
+  }
+
   // Active subscription - always allow
   if (
     user.subscription_status === 'active' &&

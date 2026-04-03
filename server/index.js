@@ -16,6 +16,9 @@ const atsRoutes = require('./routes/atsScore');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust proxy (required for Render, Railway, etc behind reverse proxy)
+app.set('trust proxy', 1);
+
 // Security
 app.use(helmet());
 app.use(cors({

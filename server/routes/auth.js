@@ -19,6 +19,7 @@ function userResponse(user) {
     freeUsesRemaining: user.free_uses_remaining,
     subscriptionStatus: user.subscription_status,
     subscriptionEnd: user.subscription_end,
+    isAdmin: user.is_admin || false,
   };
 }
 
